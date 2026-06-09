@@ -32,8 +32,24 @@ const FEED_LANGUAGE = process.env.FEED_LANGUAGE || "en-us";
 const FEED_COPYRIGHT = process.env.FEED_COPYRIGHT || "";
 const FEED_IMAGE_URL = process.env.FEED_IMAGE_URL || "";
 
-interface VideoMetadata {
+interface VideoStream {
+  stream_type?: string;
+  url?: string;
+}
+
+interface PlaylistVideoItem {
   streams?: VideoStream[];
+}
+
+interface FusionLeadArt {
+  type?: string;
+  streams?: VideoStream[];
+}
+
+interface FusionGlobalContent {
+  promo_items?: {
+    lead_art?: FusionLeadArt;
+  };
 }
 
 interface VideoInfo {
@@ -42,9 +58,32 @@ interface VideoInfo {
   videoUrl?: string;
 }
 
-interface VideoStream {
-  stream_type?: string;
-  url?: string;
+const POWA_PLAYLIST_API =
+  "https://gray-config-prod.api.arc-cdn.net/video/v1/ans/playlists/findByPlaylist";
+
+function pickStreamUrl(streams: VideoStream[] | undefined): string | undefined {
+  if (!streams || streams.length === 0) return undefined;
+  const mp4 = streams.find((s) => s.stream_type === "mp4" && s.url);
+  if (mp4?.url) return mp4.url;
+  const ts = streams.find((s) => s.stream_type === "ts" && s.url);
+  return ts?.url;
+}
+
+async function fetchPlaylistStreamUrls(name: string): Promise<string[]> {
+  const url = `${POWA_PLAYLIST_API}?name=${encodeURIComponent(name)}&cb=powaCallback`;
+  const response = await axios.get<string>(url, {
+    responseType: "text",
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+    },
+  });
+  const jsonStr = response.data.replace(/^[^(]*\(/, "").replace(/\);?\s*$/, "");
+  const data = JSON.parse(jsonStr) as { playlistItems?: PlaylistVideoItem[] };
+  const items = data.playlistItems ?? [];
+  return items
+    .map((item) => pickStreamUrl(item.streams))
+    .filter((u): u is string => !!u);
 }
 
 async function ensureDataDir(): Promise<void> {
@@ -170,20 +209,19 @@ async function searchForVideos(): Promise<VideoInfo[]> {
   }
 }
 
-async function extractVideoUrl(pageUrl: string): Promise<string | null> {
-  console.log(`Extracting video URL from: ${pageUrl}`);
+async function extractVideoUrls(pageUrl: string): Promise<string[]> {
+  console.log(`Extracting video URL(s) from: ${pageUrl}`);
   const html = await fetchPage(pageUrl);
 
-  // 1) Try to extract Arc/Fusion metadata JSON
+  // 1) Try Fusion.globalContent — single video at promo_items.lead_art
   const metadataMatch = html.match(/Fusion\.globalContent=({[\s\S]*?});/);
   if (metadataMatch) {
     try {
-      const metadata = JSON.parse(metadataMatch[1]) as VideoMetadata;
-      if (metadata.streams && Array.isArray(metadata.streams)) {
-        const mp4Stream = metadata.streams.find((s) => s.stream_type === "mp4");
-        if (mp4Stream?.url) return mp4Stream.url;
-        const hlsStream = metadata.streams.find((s) => s.stream_type === "ts");
-        if (hlsStream?.url) return hlsStream.url;
+      const metadata = JSON.parse(metadataMatch[1]) as FusionGlobalContent;
+      const leadArt = metadata.promo_items?.lead_art;
+      if (leadArt?.type === "video") {
+        const url = pickStreamUrl(leadArt.streams);
+        if (url) return [url];
       }
     } catch {
       // ignore JSON parse errors
@@ -192,17 +230,33 @@ async function extractVideoUrl(pageUrl: string): Promise<string | null> {
 
   const $ = cheerio.load(html);
 
-  // 2) Direct <video><source></source></video>
-  const videoSrc = $("video source").attr("src") || $("video").attr("src");
-  if (videoSrc) return videoSrc;
+  // 2) Powa playlist player — multi-part (or named single-item) playlist
+  const playlistEl = $('[id^="powa-playlist"]').first();
+  const playlistName = playlistEl.attr("data-playlist");
+  if (playlistName) {
+    try {
+      const urls = await fetchPlaylistStreamUrls(playlistName);
+      if (urls.length > 0) {
+        console.log(
+          `Found playlist "${playlistName}" with ${urls.length} part(s)`,
+        );
+        return urls;
+      }
+    } catch (error) {
+      console.warn(`Failed to fetch playlist "${playlistName}":`, error);
+    }
+  }
 
-  // 3) Look for obvious media URLs in inline scripts
+  // 3) Direct <video><source></source></video>
+  const videoSrc = $("video source").attr("src") || $("video").attr("src");
+  if (videoSrc) return [videoSrc];
+
+  // 4) Look for obvious media URLs in inline scripts
   const scriptsText = $("script")
     .map((_i, el) => $(el).html() || "")
     .get()
     .join("\n");
 
-  // Common patterns: m3u8/mp4 URLs, jwplayer/players configs, generic file/src keys
   const urlFromScripts =
     scriptsText.match(
       /https?:\/\/[^"'\s>]+\.(?:m3u8|mp4)(?:\?[^"'\s>]*)?/i,
@@ -210,16 +264,16 @@ async function extractVideoUrl(pageUrl: string): Promise<string | null> {
     scriptsText.match(
       /\b(?:file|src|source|url)\b\s*[:=]\s*["'](https?:[^"']+\.(?:m3u8|mp4)[^"']*)["']/i,
     )?.[1];
-  if (urlFromScripts) return urlFromScripts;
+  if (urlFromScripts) return [urlFromScripts];
 
-  // 4) Check data attributes commonly used by players
+  // 5) Check data attributes commonly used by players
   const dataUrl =
     $("[data-video-src]").attr("data-video-src") ||
     $("[data-src]").attr("data-src") ||
     $("[data-url]").attr("data-url");
-  if (dataUrl && /\.(?:m3u8|mp4)(?:\?|$)/i.test(dataUrl)) return dataUrl;
+  if (dataUrl && /\.(?:m3u8|mp4)(?:\?|$)/i.test(dataUrl)) return [dataUrl];
 
-  // 5) Fallback to Puppeteer to capture dynamically loaded media URLs
+  // 6) Fallback to Puppeteer to capture dynamically loaded media URLs
   let browser: puppeteer.Browser | undefined;
   try {
     browser = await puppeteer.launch({
@@ -231,7 +285,6 @@ async function extractVideoUrl(pageUrl: string): Promise<string | null> {
     const page = await browser.newPage();
     let capturedUrl: string | null = null;
 
-    // Capture network media
     page.on("response", (resp) => {
       try {
         const u = resp.url();
@@ -245,7 +298,6 @@ async function extractVideoUrl(pageUrl: string): Promise<string | null> {
 
     await page.goto(pageUrl, { waitUntil: "networkidle2", timeout: 30000 });
 
-    // Try DOM inspection after JS executes
     const domUrl = (await page.evaluate(() => {
       const s = document.querySelector<HTMLSourceElement>("video source");
       if (s?.src) return s.src;
@@ -257,8 +309,8 @@ async function extractVideoUrl(pageUrl: string): Promise<string | null> {
       return null as unknown as string | null;
     })) as unknown as string | null;
 
-    if (domUrl) return domUrl;
-    if (capturedUrl) return capturedUrl;
+    if (domUrl) return [domUrl];
+    if (capturedUrl) return [capturedUrl];
   } catch {
     // ignore puppeteer issues
   } finally {
@@ -266,7 +318,7 @@ async function extractVideoUrl(pageUrl: string): Promise<string | null> {
   }
 
   console.warn("Could not find video URL in page");
-  return null;
+  return [];
 }
 
 interface ArticleMeta {
@@ -372,38 +424,10 @@ type EpisodeForFeed = {
   duration?: string; // HH:MM:SS
 };
 
-async function downloadVideo(
-  videoUrl: string,
-  filename: string,
-): Promise<boolean> {
-  const filePath = path.join(DATA_DIR, filename);
-  const audioPath = path.join(
-    DATA_DIR,
-    AUDIO_SUBDIR,
-    filename.replace(/\.mp4$/i, ".mp3"),
-  );
-
-  // Check if audio file already exists (no need to re-download/convert)
+async function downloadFile(url: string, destPath: string): Promise<boolean> {
   try {
-    await fs.stat(audioPath);
-    console.log(`Audio already exists: ${path.basename(audioPath)}`);
-    return false; // Don't call extractAudio since audio is already done
-  } catch {
-    // Audio doesn't exist, check for video
-  }
-
-  // Check if video file already exists
-  try {
-    await fs.stat(filePath);
-    console.log(`Video already exists: ${filename}`);
-    return true; // Return true so extractAudio will be called
-  } catch {
-    // Video doesn't exist, proceed with download
-  }
-
-  try {
-    console.log(`Downloading video to: ${filePath}`);
-    const response = await axios.get(videoUrl, {
+    console.log(`Downloading: ${path.basename(destPath)}`);
+    const response = await axios.get(url, {
       responseType: "stream",
       headers: {
         "User-Agent":
@@ -412,16 +436,15 @@ async function downloadVideo(
       timeout: 60000,
     });
 
-    await pipeline(response.data, createWriteStream(filePath));
-    console.log(`Successfully downloaded: ${filename}`);
+    await pipeline(response.data, createWriteStream(destPath));
+    console.log(`Successfully downloaded: ${path.basename(destPath)}`);
     return true;
   } catch (error) {
-    console.error(`Failed to download video: ${filename}`, error);
-    // Try to clean up partial file
+    console.error(`Failed to download: ${url}`, error);
     try {
-      await fs.unlink(filePath);
+      await fs.unlink(destPath);
     } catch {
-      // Ignore cleanup errors
+      // ignore cleanup errors
     }
     return false;
   }
@@ -444,35 +467,102 @@ function buildFilenameFromPubDate(pubDate?: string): string {
   return `Mental-Health-Mondays-${dateStr}.mp4`;
 }
 
-async function extractAudio(videoFilename: string): Promise<boolean> {
-  const videoPath = path.join(DATA_DIR, videoFilename);
-  const audioPath = path.join(
-    DATA_DIR,
-    AUDIO_SUBDIR,
-    videoFilename.replace(/\.mp4$/i, ".mp3"),
-  );
-
+async function extractAudio(
+  videoPaths: string[],
+  audioPath: string,
+): Promise<boolean> {
   try {
-    console.log(`Extracting audio from: ${videoFilename}`);
-    await execFileAsync("ffmpeg", [
-      "-i",
-      videoPath,
-      "-q:a",
-      "9",
-      "-map",
-      "a",
-      audioPath,
-      "-y",
-    ]);
-
-    // Delete the original video file
-    await fs.unlink(videoPath);
+    if (videoPaths.length === 1) {
+      console.log(`Extracting audio from: ${path.basename(videoPaths[0])}`);
+      await execFileAsync("ffmpeg", [
+        "-i",
+        videoPaths[0],
+        "-q:a",
+        "9",
+        "-map",
+        "a",
+        audioPath,
+        "-y",
+      ]);
+    } else {
+      console.log(
+        `Extracting and concatenating audio from ${videoPaths.length} parts`,
+      );
+      const args: string[] = [];
+      for (const p of videoPaths) args.push("-i", p);
+      const filter =
+        videoPaths.map((_, i) => `[${i}:a]`).join("") +
+        `concat=n=${videoPaths.length}:v=0:a=1[out]`;
+      args.push(
+        "-filter_complex",
+        filter,
+        "-map",
+        "[out]",
+        "-q:a",
+        "9",
+        audioPath,
+        "-y",
+      );
+      await execFileAsync("ffmpeg", args);
+    }
     console.log(`Successfully extracted audio to: ${path.basename(audioPath)}`);
     return true;
   } catch (error) {
-    console.error(`Failed to extract audio from ${videoFilename}:`, error);
+    console.error(`Failed to extract audio:`, error);
     return false;
   }
+}
+
+async function produceEpisodeAudio(
+  videoUrls: string[],
+  baseFilename: string,
+): Promise<boolean> {
+  const audioPath = path.join(
+    DATA_DIR,
+    AUDIO_SUBDIR,
+    baseFilename.replace(/\.mp4$/i, ".mp3"),
+  );
+
+  try {
+    await fs.stat(audioPath);
+    console.log(`Audio already exists: ${path.basename(audioPath)}`);
+    return true;
+  } catch {
+    // audio doesn't exist, continue
+  }
+
+  const baseNoExt = baseFilename.replace(/\.mp4$/i, "");
+  const partFilenames =
+    videoUrls.length === 1
+      ? [baseFilename]
+      : videoUrls.map((_, i) => `${baseNoExt}.part${i + 1}.mp4`);
+  const partPaths = partFilenames.map((f) => path.join(DATA_DIR, f));
+
+  for (let i = 0; i < videoUrls.length; i++) {
+    const exists = await fs
+      .stat(partPaths[i])
+      .then(() => true)
+      .catch(() => false);
+    if (exists) {
+      console.log(`Part already downloaded: ${partFilenames[i]}`);
+      continue;
+    }
+    const ok = await downloadFile(videoUrls[i], partPaths[i]);
+    if (!ok) return false;
+  }
+
+  const extracted = await extractAudio(partPaths, audioPath);
+  if (!extracted) return false;
+
+  for (const p of partPaths) {
+    try {
+      await fs.unlink(p);
+    } catch {
+      // ignore cleanup errors
+    }
+  }
+
+  return true;
 }
 
 async function probeDurationSeconds(filePath: string): Promise<number | null> {
@@ -607,8 +697,8 @@ async function main(): Promise<void> {
     for (const video of videos) {
       console.log(`\nProcessing: ${video.title}`);
 
-      const videoUrl = await extractVideoUrl(video.url);
-      if (!videoUrl) {
+      const videoUrls = await extractVideoUrls(video.url);
+      if (videoUrls.length === 0) {
         console.warn(`Skipping ${video.title} - could not extract video URL`);
         continue;
       }
@@ -616,22 +706,18 @@ async function main(): Promise<void> {
       // Fetch article metadata first to derive filename from publication date
       const meta = await fetchArticleMeta(video.url);
       const filename = buildFilenameFromPubDate(meta.pubDate);
-      const downloaded = await downloadVideo(videoUrl, filename);
-
       const audioPath = path.join(
         DATA_DIR,
         AUDIO_SUBDIR,
         filename.replace(/\.mp4$/i, ".mp3"),
       );
 
-      if (downloaded) {
-        const extracted = await extractAudio(filename);
-        if (!extracted) {
-          console.warn(
-            `Skipping tagging for ${filename} - audio extraction failed`,
-          );
-          continue;
-        }
+      const produced = await produceEpisodeAudio(videoUrls, filename);
+      if (!produced) {
+        console.warn(
+          `Skipping tagging for ${filename} - audio production failed`,
+        );
+        continue;
       }
 
       // Tag audio if it exists (reusing fetched metadata)
